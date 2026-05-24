@@ -1,2 +1,6 @@
 Labs/
 myenv/
+Project/roboflow/
+Project/roboflow2/
+Project/__pycache__/
+Project/weights/
