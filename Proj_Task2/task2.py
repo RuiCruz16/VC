@@ -219,6 +219,49 @@ def build_model(arch="resnet18"):
         raise ValueError(f"Unknown architecture: {arch}")
     return model
 
+# EFFICIENCY METRICS (model size + inference speed)
+def count_parameters(model):
+    """
+    Return (total_params, trainable_params) for a model. Reported in the
+    comparison table so accuracy can be weighed against model capacity/size.
+    """
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+@torch.no_grad()
+def measure_inference_time(model, n_warmup=10, n_runs=50, batch_size=1):
+    """
+    Measure average single-image inference latency (ms) and throughput (img/s).
+
+    A few warm-up passes are discarded first (so kernel/cuDNN autotuning and
+    lazy allocations don't pollute the timing). On GPU we call
+    torch.cuda.synchronize() around the timed region, otherwise the CUDA
+    kernels are asynchronous and the measured time would be meaningless.
+    """
+    import time
+
+    model.eval()
+    dummy = torch.randn(batch_size, 3, IMG_SIZE, IMG_SIZE, device=DEVICE)
+
+    # Warm-up (not timed)
+    for _ in range(n_warmup):
+        model(dummy)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    # Timed runs
+    start = time.perf_counter()
+    for _ in range(n_runs):
+        model(dummy)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    ms_per_image = (elapsed / (n_runs * batch_size)) * 1000.0
+    images_per_sec = (n_runs * batch_size) / elapsed
+    return ms_per_image, images_per_sec
+
 # METRICS
 def compute_metrics(preds, targets):
     """
@@ -424,20 +467,60 @@ def save_loss_curves(arch, history, best_epoch):
     print(f"Saved {out}")
 
 def save_comparison(results_by_arch):
-    """Print a comparison table and save it as CSV."""
+    """
+    Print a comparison table and save it as CSV. Besides accuracy metrics, this
+    reports model size (parameters) and inference cost (latency/throughput),
+    so architectures can be compared on the accuracy-vs-cost trade-off.
+    """
     print("\n================ ARCHITECTURE COMPARISON (test set) ================")
-    header = f"{'arch':<18}{'MAE':>8}{'RMSE':>8}{'acc':>8}{'acc±1':>8}"
+    header = (f"{'arch':<18}{'MAE':>8}{'RMSE':>8}{'acc':>8}{'acc±1':>8}"
+              f"{'params(M)':>12}{'infer(ms)':>11}{'img/s':>9}")
     print(header)
     print("-" * len(header))
     os.makedirs(REPORTS_DIR, exist_ok=True)
     with open(os.path.join(REPORTS_DIR, "task2_comparison.csv"), "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["arch", "mae", "rmse", "acc_exact", "acc_within_1"])
+        writer.writerow(["arch", "mae", "rmse", "acc_exact", "acc_within_1",
+                         "total_params", "trainable_params",
+                         "infer_ms_per_image", "throughput_img_s"])
         for arch, m in results_by_arch.items():
+            params_m = m["total_params"] / 1e6
             print(f"{arch:<18}{m['mae']:>8.3f}{m['rmse']:>8.3f}"
-                  f"{m['acc_exact']:>8.3f}{m['acc_within_1']:>8.3f}")
-            writer.writerow([arch, m["mae"], m["rmse"], m["acc_exact"], m["acc_within_1"]])
+                  f"{m['acc_exact']:>8.3f}{m['acc_within_1']:>8.3f}"
+                  f"{params_m:>12.2f}{m['infer_ms_per_image']:>11.3f}"
+                  f"{m['throughput_img_s']:>9.1f}")
+            writer.writerow([arch, m["mae"], m["rmse"], m["acc_exact"], m["acc_within_1"],
+                             m["total_params"], m["trainable_params"],
+                             f"{m['infer_ms_per_image']:.4f}", f"{m['throughput_img_s']:.2f}"])
     print(f"Saved {REPORTS_DIR}/task2_comparison.csv")
+
+def save_efficiency_scatter(results_by_arch):
+    """
+    Scatter of inference latency (x) vs MAE (y). The closer to the bottom-left,
+    the better (fast AND accurate). Marker size encodes the parameter count, so
+    the accuracy/speed/size trade-off is visible in a single plot.
+    """
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    archs = list(results_by_arch.keys())
+    xs = [results_by_arch[a]["infer_ms_per_image"] for a in archs]
+    ys = [results_by_arch[a]["mae"] for a in archs]
+    sizes = [max(40.0, results_by_arch[a]["total_params"] / 1e6 * 40.0) for a in archs]
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(xs, ys, s=sizes, alpha=0.6, color="teal")
+    for a, x, y in zip(archs, xs, ys):
+        params_m = results_by_arch[a]["total_params"] / 1e6
+        plt.annotate(f"{a}\n({params_m:.1f}M params)", (x, y),
+                     textcoords="offset points", xytext=(8, 8), fontsize=9)
+    plt.xlabel("Inference time per image (ms)")
+    plt.ylabel("Test MAE")
+    plt.title("Accuracy vs. inference cost\n(marker size ∝ #params; bottom-left is best)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out = os.path.join(REPORTS_DIR, "task2_efficiency_scatter.png")
+    plt.savefig(out, dpi=120)
+    plt.close()
+    print(f"Saved {out}")
 
 def save_scatter(arch, preds, targets):
     """Scatter of predicted vs true counts."""
@@ -531,11 +614,24 @@ def run_training():
         model = build_model(arch).to(DEVICE)
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
         test_metrics, preds, targets, _ = evaluate(model, test_loader)
+
+        # Efficiency metrics: parameter count + single-image inference latency
+        total_params, trainable_params = count_parameters(model)
+        ms_per_image, images_per_sec = measure_inference_time(model)
+        test_metrics["total_params"] = total_params
+        test_metrics["trainable_params"] = trainable_params
+        test_metrics["infer_ms_per_image"] = ms_per_image
+        test_metrics["throughput_img_s"] = images_per_sec
+        print(f"  {arch}: {total_params/1e6:.2f}M params "
+              f"({trainable_params/1e6:.2f}M trainable) | "
+              f"{ms_per_image:.3f} ms/img | {images_per_sec:.1f} img/s")
+
         results_by_arch[arch] = test_metrics
         save_scatter(arch, preds, targets)
         save_error_by_count(arch, preds, targets)
 
     save_comparison(results_by_arch)
+    save_efficiency_scatter(results_by_arch)
 
 def main():
     parser = argparse.ArgumentParser(description="Task 2 - CNN ball counting")
