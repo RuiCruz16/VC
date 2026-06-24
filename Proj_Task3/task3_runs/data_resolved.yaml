@@ -4,4 +4,4 @@ test: test/images
 nc: 1
 names:
 - Ball
-path: /home/rui/Documentos/VC/Proj_Task3/dataset
+path: c:\Users\MiguelGuerrinha\FEUP\VC\Proj_Task3\dataset
